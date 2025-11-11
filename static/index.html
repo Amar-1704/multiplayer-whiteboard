@@ -1,0 +1,93 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Whiteboard</title>
+  <style>
+    body { margin:0; font-family: Arial, sans-serif; display:flex; flex-direction:column; height:100vh; }
+    #toolbar { padding:8px; background:#222; color:#fff; display:flex; gap:8px; align-items:center; }
+    #canvas { flex:1; background:#fff; display:block; cursor:crosshair; }
+    button,input { padding:6px 8px; border-radius:4px; border:none; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <label>Color: <input id="color" type="color" value="#000000"></label>
+    <label>Size: <input id="size" type="range" min="1" max="10" value="2"></label>
+    <button id="clear">Clear</button>
+    <div style="margin-left:auto">Connected users: <span id="clients">?</span></div>
+  </div>
+  <canvas id="canvas" width="1000" height="600"></canvas>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const colorPicker = document.getElementById('color');
+    const sizePicker = document.getElementById('size');
+    const clearBtn = document.getElementById('clear');
+    const clientsEl = document.getElementById('clients');
+
+    const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${wsScheme}://${location.host}/ws`);
+
+    let drawing = false;
+    let lastX = 0, lastY = 0;
+
+    function drawLine(x1, y1, x2, y2, color, size) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = size;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+
+    canvas.addEventListener('mousedown', (e) => {
+      drawing = true;
+      lastX = e.offsetX;
+      lastY = e.offsetY;
+    });
+
+    canvas.addEventListener('mouseup', () => drawing = false);
+    canvas.addEventListener('mouseout', () => drawing = false);
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (!drawing) return;
+      const x = e.offsetX, y = e.offsetY;
+      const color = colorPicker.value;
+      const size = parseInt(sizePicker.value, 10);
+      drawLine(lastX, lastY, x, y, color, size);
+      const msg = { type: 'draw', x1: lastX, y1: lastY, x2: x, y2: y, color, size };
+      socket.send(JSON.stringify(msg));
+      lastX = x; lastY = y;
+    });
+
+    clearBtn.addEventListener('click', () => {
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      socket.send(JSON.stringify({ type: 'clear' }));
+    });
+
+    socket.onmessage = (evt) => {
+      const msg = JSON.parse(evt.data);
+      if (msg.type === 'draw') {
+        drawLine(msg.x1, msg.y1, msg.x2, msg.y2, msg.color, msg.size);
+      } else if (msg.type === 'clear') {
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+      } else if (msg.type === 'clients') {
+        clientsEl.textContent = msg.count;
+      }
+    };
+
+    socket.onopen = () => console.log('Connected');
+    socket.onclose = () => console.log('Disconnected');
+
+    function resize() {
+      canvas.width = Math.min(window.innerWidth, 1200);
+      canvas.height = window.innerHeight - document.getElementById('toolbar').offsetHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+  </script>
+</body>
+</html>
