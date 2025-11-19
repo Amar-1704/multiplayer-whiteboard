@@ -1,0 +1,426 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Whiteboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{--toolbar-bg:#222;--toolbar-fg:#fff;--accent:#1e90ff}
+    body { margin:0; font-family: Arial, sans-serif; display:flex; flex-direction:column; height:100vh; }
+    #toolbar { padding:8px; background:var(--toolbar-bg); color:var(--toolbar-fg); display:flex; gap:8px; align-items:center; }
+    #canvas { flex:1; background:#fff; display:block; cursor:crosshair; }
+    button,input,select,textarea { padding:6px 8px; border-radius:4px; border:none; }
+    #left-tools{display:flex; gap:8px; align-items:center}
+    .tool-button{background:#fff; color:#000; cursor:pointer}
+    .active{outline:2px solid var(--accent)}
+    #sticky-area{position:absolute; inset:48px 8px 8px 8px; pointer-events:none} /* area for sticky notes */
+    .sticky{position:absolute; width:160px; min-height:80px; background:yellow; padding:8px; box-shadow:0 2px 6px rgba(0,0,0,0.2); resize:both; overflow:auto; pointer-events:auto;}
+    #graph-modal{position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); background:#fff; padding:12px; box-shadow:0 6px 18px rgba(0,0,0,0.3); display:none; z-index:2000}
+    #controls { display:flex; gap:8px; align-items:center }
+    #clients{min-width:26px; display:inline-block; text-align:center}
+    small.note{font-size:11px; color:#ddd}
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <div id="left-tools">
+      <button id="tool-pen" class="tool-button active">Pen</button>
+      <button id="tool-eraser" class="tool-button">Eraser</button>
+      <label style="color:#fff">Shape
+        <select id="shape-select">
+          <option value="none">None</option>
+          <option value="line">Line</option>
+          <option value="rect">Rectangle</option>
+          <option value="circle">Circle</option>
+        </select>
+      </label>
+
+      <label style="color:#fff">Color: <input id="color" type="color" value="#000000"></label>
+      <label style="color:#fff">Size: <input id="size" type="range" min="1" max="30" value="3"></label>
+
+      <button id="toggle-grid" class="tool-button">Grid</button>
+      <button id="add-sticky" class="tool-button">Add Sticky</button>
+      <button id="graph-btn" class="tool-button">Graph</button>
+      <button id="clear" class="tool-button">Clear</button>
+      <button id="record-voice" class="tool-button">Record Voice</button>
+      <small class="note"> (voice sent to others)</small>
+    </div>
+
+    <div id="controls" style="margin-left:auto;">
+      Connected users: <span id="clients">0</span>
+    </div>
+  </div>
+
+  <div id="sticky-area"></div>
+  <canvas id="canvas" width="1000" height="600"></canvas>
+
+  <!-- Graph modal -->
+  <div id="graph-modal">
+    <h4>Draw simple graph</h4>
+    <label>Enter comma-separated numbers: <br><input id="graph-data" style="width:300px"></label><br><br>
+    <button id="draw-graph">Draw</button>
+    <button id="close-graph">Close</button>
+  </div>
+
+  <script>
+    /* ========== Setup and helpers ========== */
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const colorPicker = document.getElementById('color');
+    const sizePicker = document.getElementById('size');
+    const clearBtn = document.getElementById('clear');
+    const clientsEl = document.getElementById('clients');
+    const stickyArea = document.getElementById('sticky-area');
+    const toggleGridBtn = document.getElementById('toggle-grid');
+    const addStickyBtn = document.getElementById('add-sticky');
+    const graphBtn = document.getElementById('graph-btn');
+    const recordBtn = document.getElementById('record-voice');
+
+    let currentTool = 'pen'; // pen, eraser
+    let currentShape = 'none'; // none, line, rect, circle
+    let drawing = false;
+    let lastX = 0, lastY = 0;
+    let gridOn = false;
+
+    // websocket
+    const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${wsScheme}://${location.host}/ws`);
+
+    socket.addEventListener('open', () => console.log('WS open'));
+    socket.addEventListener('close', () => console.log('WS closed'));
+
+    socket.addEventListener('message', (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        handleMessage(msg);
+      } catch (e) {
+        console.error('Invalid message', e);
+      }
+    });
+
+    function sendMessage(obj){ socket.send(JSON.stringify(obj)); }
+
+    function drawLine(x1,y1,x2,y2,color,size,composite='source-over'){
+      ctx.globalCompositeOperation = composite;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = size;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x1,y1);
+      ctx.lineTo(x2,y2);
+      ctx.stroke();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    function drawRect(x,y,w,h,color,size,fill=false){
+      ctx.lineWidth = size; ctx.strokeStyle = color;
+      if(fill){ ctx.fillStyle = color; ctx.fillRect(x,y,w,h); }
+      ctx.strokeRect(x,y,w,h);
+    }
+
+    function drawCircle(cx,cy,r,color,size,fill=false){
+      ctx.lineWidth = size; ctx.strokeStyle = color;
+      ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); if(fill){ ctx.fillStyle=color; ctx.fill(); } ctx.stroke();
+    }
+
+    /* ========== Grid overlay ========== */
+    function drawGrid(){
+      const step = 25;
+      ctx.save();
+      ctx.strokeStyle = '#eee';
+      ctx.lineWidth = 1;
+      for(let x=0;x<canvas.width;x+=step){
+        ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
+      }
+      for(let y=0;y<canvas.height;y+=step){
+        ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    /* ========== Resizing ========== */
+    function resize(){
+      // preserve drawing by copying to temp canvas
+      const w = Math.min(window.innerWidth, 1400);
+      const h = window.innerHeight - document.getElementById('toolbar').offsetHeight;
+      const temp = document.createElement('canvas');
+      temp.width = canvas.width; temp.height = canvas.height;
+      temp.getContext('2d').drawImage(canvas,0,0);
+      canvas.width = w; canvas.height = h;
+      ctx.drawImage(temp,0,0);
+      if(gridOn) drawGrid();
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    /* ========== Tool buttons ========== */
+    document.getElementById('tool-pen').onclick = ()=>{ selectTool('pen'); }
+    document.getElementById('tool-eraser').onclick = ()=>{ selectTool('eraser'); }
+
+    function selectTool(t){
+      currentTool = t;
+      document.querySelectorAll('.tool-button').forEach(b=>b.classList.remove('active'));
+      document.getElementById('tool-'+t).classList.add('active');
+    }
+
+    document.getElementById('shape-select').addEventListener('change', (e)=>{
+      currentShape = e.target.value;
+    });
+
+    toggleGridBtn.addEventListener('click', ()=>{
+      gridOn = !gridOn;
+      redrawCanvas();
+      if(gridOn) drawGrid();
+      toggleGridBtn.classList.toggle('active', gridOn);
+    });
+
+    /* ========== Drawing logic (mouse) ========== */
+    let shapeStart = null;
+    canvas.addEventListener('mousedown', (e)=>{
+      drawing = true;
+      lastX = e.offsetX; lastY = e.offsetY;
+      shapeStart = {x:lastX,y:lastY};
+    });
+    canvas.addEventListener('mouseup', (e)=>{
+      if(!drawing) return;
+      drawing = false;
+      const x = e.offsetX, y = e.offsetY;
+      if(currentShape !== 'none' && shapeStart){
+        // draw shape final and broadcast
+        const color = colorPicker.value; const size = parseInt(sizePicker.value,10);
+        if(currentShape==='line'){
+          drawLine(shapeStart.x,shapeStart.y,x,y,color,size);
+          sendMessage({type:'draw', sub:'line', x1:shapeStart.x,y1:shapeStart.y,x2:x,y2:y,color,size});
+        } else if(currentShape==='rect'){
+          const w = x-shapeStart.x, h = y-shapeStart.y;
+          drawRect(shapeStart.x,shapeStart.y,w,h,color,size);
+          sendMessage({type:'draw', sub:'rect', x:shapeStart.x,y:shapeStart.y,w,h,color,size});
+        } else if(currentShape==='circle'){
+          const dx = x-shapeStart.x, dy = y-shapeStart.y, r = Math.sqrt(dx*dx+dy*dy);
+          drawCircle(shapeStart.x,shapeStart.y,r,color,size);
+          sendMessage({type:'draw', sub:'circle', x:shapeStart.x,y:shapeStart.y,r,color,size});
+        }
+      }
+      shapeStart = null;
+    });
+
+    canvas.addEventListener('mousemove', (e)=>{
+      if(!drawing) return;
+      const x = e.offsetX, y = e.offsetY;
+      const color = colorPicker.value;
+      const size = parseInt(sizePicker.value,10);
+      if(currentShape==='none'){
+        if(currentTool==='pen'){
+          drawLine(lastX,lastY,x,y,color,size,'source-over');
+          sendMessage({type:'draw', sub:'free', x1:lastX,y1:lastY,x2:x,y2:y,color,size});
+        } else if(currentTool==='eraser'){
+          // emulate eraser by drawing white with bigger size
+          drawLine(lastX,lastY,x,y,'#ffffff', size*3, 'source-over');
+          sendMessage({type:'draw', sub:'eraser', x1:lastX,y1:lastY,x2:x,y2:y, size:size*3});
+        }
+        lastX = x; lastY = y;
+      } else {
+        // while drawing shape, show preview by redrawing (simple approach)
+        // For simplicity we won't broadcast previews to others.
+        redrawCanvas();
+        if(gridOn) drawGrid();
+        const sx = shapeStart.x, sy = shapeStart.y;
+        ctx.save(); ctx.setLineDash([6,4]); ctx.strokeStyle = color; ctx.lineWidth = size;
+        if(currentShape==='line'){
+          ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(x,y); ctx.stroke();
+        } else if(currentShape==='rect'){
+          ctx.strokeRect(sx,sy,x-sx,y-sy);
+        } else if(currentShape==='circle'){
+          const dx = x-sx, dy=y-sy, r = Math.sqrt(dx*dx+dy*dy);
+          ctx.beginPath(); ctx.arc(sx,sy,r,0,Math.PI*2); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    });
+
+    clearBtn.addEventListener('click', ()=>{
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      if(gridOn) drawGrid();
+      sendMessage({type:'clear'});
+    });
+
+    /* ========== Sticky notes ========== */
+    function createSticky(x=50,y=50,text='') {
+      const s = document.createElement('div');
+      s.className = 'sticky';
+      s.contentEditable = true;
+      s.style.left = x+'px'; s.style.top = y+'px';
+      s.innerText = text || 'New note...';
+      stickyArea.appendChild(s);
+      makeDraggable(s);
+      // broadcast creation
+      const rect = s.getBoundingClientRect();
+      sendMessage({type:'sticky', action:'create', x:x, y:y, html:s.innerText});
+      s.addEventListener('input', ()=>{
+        sendMessage({type:'sticky', action:'edit', html:s.innerText});
+      });
+      s.addEventListener('dblclick', ()=>{
+        // remove on double click
+        s.remove();
+        sendMessage({type:'sticky', action:'delete'});
+      });
+      return s;
+    }
+
+    function makeDraggable(el){
+      el.addEventListener('mousedown',(e)=>{
+        if(e.target !== el) return;
+        let ox = e.clientX, oy = e.clientY;
+        const startLeft = parseInt(el.style.left||0,10); const startTop = parseInt(el.style.top||0,10);
+        function mm(ev){
+          const nx = startLeft + (ev.clientX-ox), ny = startTop + (ev.clientY-oy);
+          el.style.left = nx+'px'; el.style.top = ny+'px';
+        }
+        function mu(){
+          document.removeEventListener('mousemove',mm); document.removeEventListener('mouseup',mu);
+          sendMessage({type:'sticky', action:'move', x:parseInt(el.style.left), y:parseInt(el.style.top)});
+        }
+        document.addEventListener('mousemove',mm); document.addEventListener('mouseup',mu);
+      });
+    }
+
+    addStickyBtn.addEventListener('click', ()=> createSticky(60,60,'Double-click to delete'));
+
+    /* ========== Graphing (simple) ========== */
+    const graphModal = document.getElementById('graph-modal');
+    document.getElementById('draw-graph').onclick = ()=>{
+      const val = document.getElementById('graph-data').value;
+      const arr = val.split(',').map(s=>parseFloat(s.trim())).filter(n=>!isNaN(n));
+      if(arr.length===0) return alert('Enter numbers');
+      // draw in main canvas at top-left small area for demo
+      const padding = 20; const w = 300; const h = 150;
+      const max = Math.max(...arr); const min = Math.min(...arr);
+      // draw axes
+      const gx = 20, gy = 20;
+      ctx.save();
+      ctx.strokeStyle = '#000'; ctx.fillStyle='#000'; ctx.lineWidth=1;
+      ctx.strokeRect(gx,gy,w,h);
+      // plot
+      ctx.beginPath();
+      arr.forEach((v,i)=>{
+        const x = gx + (i/(arr.length-1||1))* (w-10);
+        const y = gy + h - ((v - min)/(max-min||1))*(h-10);
+        if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      });
+      ctx.stroke();
+      ctx.restore();
+      // broadcast simple graph command so others replicate
+      sendMessage({type:'graph', data:arr});
+      graphModal.style.display='none';
+    };
+    document.getElementById('close-graph').onclick = ()=>graphModal.style.display='none';
+    graphBtn.addEventListener('click', ()=>{ graphModal.style.display='block'; });
+
+    /* ========== Voice notes (record and send as base64) ========== */
+    let mediaRecorder = null;
+    let chunks = [];
+    recordBtn.addEventListener('click', async ()=>{
+      if(mediaRecorder && mediaRecorder.state === 'recording'){
+        mediaRecorder.stop();
+        recordBtn.textContent = 'Record Voice';
+        return;
+      }
+      if(!navigator.mediaDevices) return alert('No microphone available');
+      const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+      mediaRecorder = new MediaRecorder(stream);
+      chunks = [];
+      mediaRecorder.ondataavailable = e=>{ if(e.data.size>0) chunks.push(e.data); }
+      mediaRecorder.onstop = async ()=>{
+        const blob = new Blob(chunks, {type:'audio/webm'});
+        // convert to base64 to send via websocket
+        const reader = new FileReader();
+        reader.onload = ()=>{
+          const b64 = reader.result.split(',')[1];
+          sendMessage({type:'voice', data:b64, mime: 'audio/webm'});
+        };
+        reader.readAsDataURL(blob);
+      };
+      mediaRecorder.start();
+      recordBtn.textContent = 'Stop & Send';
+    });
+
+    /* ========== Message handler ========== */
+    function handleMessage(msg){
+      if(msg.type==='draw'){
+        // Different subtypes: free, eraser, line, rect, circle
+        if(msg.sub==='free'){
+          drawLine(msg.x1,msg.y1,msg.x2,msg.y2,msg.color,msg.size);
+        } else if(msg.sub==='eraser'){
+          drawLine(msg.x1,msg.y1,msg.x2,msg.y2,'#ffffff', msg.size);
+        } else if(msg.sub==='line'){
+          drawLine(msg.x1,msg.y1,msg.x2,msg.y2,msg.color,msg.size);
+        } else if(msg.sub==='rect'){
+          drawRect(msg.x,msg.y,msg.w,msg.h,msg.color,msg.size);
+        } else if(msg.sub==='circle'){
+          drawCircle(msg.x,msg.y,msg.r,msg.color,msg.size);
+        }
+      } else if(msg.type==='clear'){
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        if(gridOn) drawGrid();
+      } else if(msg.type==='clients'){
+        clientsEl.textContent = msg.count;
+      } else if(msg.type==='sticky'){
+        // For simplicity, handle create/edit/move/delete globally (last one wins)
+        if(msg.action==='create'){
+          createSticky(msg.x||40,msg.y||40,msg.html||'');
+        } else if(msg.action==='edit'){
+          // we won't perform exact mapping between notes — this is a simple broadcast demo
+        } else if(msg.action==='move'){
+          // ignore for now
+        } else if(msg.action==='delete'){
+          // ignore for now
+        }
+      } else if(msg.type==='graph'){
+        // draw received graph data similarly
+        const arr = msg.data;
+        if(Array.isArray(arr) && arr.length){
+          // draw small graph at top-left
+          const gx = 20, gy = 20, w=300, h=150;
+          const max = Math.max(...arr), min=Math.min(...arr);
+          ctx.save(); ctx.strokeStyle='#000'; ctx.fillStyle='#000'; ctx.lineWidth=1;
+          ctx.strokeRect(gx,gy,w,h); ctx.beginPath();
+          arr.forEach((v,i)=>{
+            const x = gx + (i/(arr.length-1||1))* (w-10);
+            const y = gy + h - ((v - min)/(max-min||1))*(h-10);
+            if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+          });
+          ctx.stroke(); ctx.restore();
+        }
+      } else if(msg.type==='voice'){
+        // reconstruct base64 audio and play it
+        const b64 = msg.data;
+        const mime = msg.mime || 'audio/webm';
+        const blob = b64ToBlob(b64, mime);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('audio'); a.controls=true; a.src=url;
+        // play automatically once loaded
+        a.addEventListener('canplay', ()=> a.play().catch(()=>{}));
+        document.body.appendChild(a); // simple approach: append to page so user can replay
+      }
+    }
+
+    function b64ToBlob(b64, mime){
+      const bytes = atob(b64);
+      let len = bytes.length;
+      const out = new Uint8Array(len);
+      for(let i=0;i<len;i++) out[i]=bytes.charCodeAt(i);
+      return new Blob([out], {type:mime});
+    }
+
+    /* ========== Utility: redrawCanvas (placeholder) ========== */
+    function redrawCanvas(){
+      // In a full app we'd keep a command history and re-render; here we keep current bitmap,
+      // so redraw is a no-op. This function exists to show where a state-sync would occur.
+    }
+
+    /* ========== Initialization: simple welcome sticky ========== */
+    createSticky(10,10,'Welcome! Use tools to draw. Double-click a note to remove it.');
+
+  </script>
+</body>
+</html>
